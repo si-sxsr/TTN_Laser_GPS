@@ -1,0 +1,254 @@
+#define REGION_AS923  // บังคับใช้ความถี่ AS923
+#include <Arduino.h>
+#include <Wire.h>
+#include <TinyGPS++.h>
+#include "heltec_nrf_lorawan.h"
+
+// --- ADXL345 Config ---
+#define ADXL_DEVICE (0x53)
+byte _buff_adxl[6];
+
+// --- TOF Sensor Settings ---
+#define TOF_ADDR 0x08
+typedef struct {
+  uint8_t id;
+  float dis;
+  uint16_t dis_status;
+  uint16_t signal_strength;
+} tof_parameter;
+tof_parameter tof0;
+
+// --- Battery Settings ---
+#define PIN_BAT_ADC      4    
+#define PIN_BAT_ADC_CTL  6    
+uint16_t batteryVoltage = 0;   
+
+// --- GPS Settings ---
+TinyGPSPlus gps;
+double latitude = 0;
+double longitude = 0;
+
+uint16_t txCounter = 0;
+// // ===== LoRaWAN OTAA Credentials =====
+// uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD8, 0x00, 0x53, 0xD1 };
+// uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+// uint8_t appKey[] = { 0xD3, 0x7F, 0xF1, 0x78, 0x54, 0x06, 0xAF, 0x40, 0xF8, 0xD1, 0x77, 0xAC, 0xB9, 0x0B, 0xBE, 0x81 };
+
+// //Chirpstack
+// //30ec3282befd69de
+// uint8_t devEui[] = { 0x30, 0xEC, 0x32, 0x82, 0xBE, 0xFD, 0x69, 0xDE };
+// uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+// // AppKey ตรงกับ Web UI: e6 90 4a f7 0d a1 94 aa 57 49 38 9c 2c 57 5e d6
+// uint8_t appKey[] ={0xe6, 0x90, 0x4a, 0xf7, 0x0d, 0xa1, 0x94, 0xaa, 0x57, 0x49, 0x38, 0x9c, 0x2c, 0x57, 0x5e, 0xd6};
+
+//ttn
+//GateWay rmutt
+uint8_t devEui[] = {0x70, 0xB3, 0xD5, 0x7E, 0xD8, 0x00, 0x53, 0xFB};
+uint8_t appEui[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+uint8_t appKey[] = {0x9C, 0x5C, 0xBA, 0xEF, 0x6A, 0x24, 0xAF, 0xC4, 0x12, 0x6B, 0xD7, 0x94, 0xC2, 0xEC, 0xD7, 0x47 };
+ 
+
+// ===== ABP Credentials (มีไว้สำรอง) =====
+uint8_t nwkSKey[] = { 0xE0, 0x70, 0x80, 0x08, 0x70, 0xE5, 0x31, 0x94, 0x29, 0x75, 0xCA, 0xFB, 0x6E, 0x27, 0x95, 0xA9 };
+uint8_t appSKey[] = { 0xD1, 0x1D, 0x6D, 0xF4, 0x7A, 0x99, 0x51, 0xA9, 0xC0, 0xCB, 0xB5, 0x43, 0x37, 0xD2, 0x85, 0x63 };
+uint32_t devAddr = (uint32_t)0x27FC8281;
+
+// ===== LoRaWAN Settings =====
+//uint16_t userChannelsMask[6] = { 0x0003, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 };
+uint16_t userChannelsMask[6] = { 0x00FF, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000 };
+LoRaMacRegion_t loraWanRegion = LORAMAC_REGION_AS923;
+DeviceClass_t loraWanClass = CLASS_A;
+bool overTheAirActivation = true;
+bool loraWanAdr = true;
+bool isTxConfirmed = true;
+uint8_t appPort = 2;
+uint32_t appTxDutyCycle = 60000; 
+uint8_t confirmedNbTrials = 4;
+#define APP_TX_DUTYCYCLE_RND 1000
+
+// --- I2C Helper Functions ---
+void writeTo(byte address, byte val) {
+  Wire.beginTransmission(ADXL_DEVICE);
+  Wire.write(address);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+void readFromADXL(byte address, int num, byte _buff[]) {
+  Wire.beginTransmission(ADXL_DEVICE);
+  Wire.write(address);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADXL_DEVICE, (uint8_t)num);
+  int i = 0;
+  while(Wire.available() && i < num) { _buff[i] = Wire.read(); i++; }
+}
+
+bool readTofData() {
+  uint8_t pdata[48];
+  Wire.beginTransmission(TOF_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(TOF_ADDR, 32);
+  int i = 0; while (Wire.available()) pdata[i++] = Wire.read();
+  
+  Wire.beginTransmission(TOF_ADDR);
+  Wire.write(0x20);
+  if (Wire.endTransmission(false) != 0) return false;
+  Wire.requestFrom(TOF_ADDR, 16);
+  while (Wire.available()) pdata[i++] = Wire.read();
+
+  tof0.dis = (float)(((uint32_t)pdata[0x24]) | ((uint32_t)pdata[0x25] << 8) | ((uint32_t)pdata[0x26] << 16) | ((uint32_t)pdata[0x27] << 24)) / 1000.0;
+  tof0.signal_strength = (uint16_t)(((uint16_t)pdata[0x2a]) | ((uint16_t)pdata[0x2b] << 8));
+  return true;
+}
+
+uint16_t readBattery() {
+  
+   pinMode(PIN_BAT_ADC_CTL, OUTPUT);
+   digitalWrite(PIN_BAT_ADC_CTL, LOW); 
+   delay(50); // รอ 50ms ให้แรงดันไฟนิ่ง
+
+  uint32_t sum = 0;
+  Serial.print("5 : "); Serial.println(analogRead(5));
+  for (int i = 0; i < 40; i++) {
+    sum += analogRead(5); // อ่านค่าอนาลอกจากพิน 5
+    delay(10);
+  }
+  uint32_t adcValue = sum / 40;
+  Serial.print("ADC Raw Value (Pin 5): "); Serial.println(adcValue); 
+    Serial.print("AR_INTERNAL : ");  Serial.println(AR_INTERNAL); 
+
+  
+  digitalWrite(PIN_BAT_ADC_CTL, HIGH);
+
+  // Voltage divider (1/2) จึงต้องคูณ 2 กลับเข้าไป
+  uint16_t mv = adcValue * 2; 
+  
+  return mv;
+}
+
+// ===== Prepare LoRaWAN Payload (Total 22 Bytes) =====
+void prepareTxFrame(uint8_t port) {
+    txCounter++;
+
+    // บังคับเปิดไฟ VEXT เลี้ยงโมดูล GPS / Sensor
+    digitalWrite(PIN_VEXT_CTL, VEXT_ENABLE); 
+    delay(200); 
+    
+    // บังคับให้อ่านข้อความ GPS ล่าสุดหลังจากตื่นนอน (ลดเวลาเหลือ 60 วินาทีเพื่อไม่ให้บล็อกระบบนานเกินไป)
+    uint32_t waitGPS = millis();
+    while (millis() - waitGPS < 60000) {
+      while (Serial2.available()) gps.encode(Serial2.read());
+    }
+
+    if (gps.location.isValid()) {
+      latitude = gps.location.lat();
+      longitude = gps.location.lng();
+    } else {
+      latitude = 0; 
+      longitude = 0;
+    }
+
+    // อ่านค่า ADXL345 และ TOF
+    readFromADXL(0x32, 6, _buff_adxl); 
+    bool tofSuccess = readTofData();
+    int32_t dis_mm = (int32_t)(tof0.dis * 1000);
+
+    batteryVoltage = readBattery(); 
+    Serial.printf("Battery processed: %d mV\n", batteryVoltage);
+
+    appDataSize = 24; 
+    int32_t lat_int = (int32_t)(latitude * 1e6);
+    int32_t lon_int = (int32_t)(longitude * 1e6);
+
+    // [0-7] GPS Payload
+    appData[0] = (lat_int >> 24); appData[1] = (lat_int >> 16); appData[2] = (lat_int >> 8); appData[3] = lat_int;
+    appData[4] = (lon_int >> 24); appData[5] = (lon_int >> 16); appData[6] = (lon_int >> 8); appData[7] = lon_int;
+    
+    // [8-13] ADXL345 Raw Data
+    appData[8] = _buff_adxl[1];  appData[9] = _buff_adxl[0];   
+    appData[10] = _buff_adxl[3]; appData[11] = _buff_adxl[2];  
+    appData[12] = _buff_adxl[5]; appData[13] = _buff_adxl[4];  
+
+    // [14-17] TOF Distance
+    appData[14] = (dis_mm >> 24); appData[15] = (dis_mm >> 16); appData[16] = (dis_mm >> 8); appData[17] = dis_mm;
+
+    // [18-19] TOF Signal Strength
+    appData[18] = (tof0.signal_strength >> 8); appData[19] = tof0.signal_strength;
+
+    // [20-21] Transmission Count
+    appData[20] = (txCounter >> 8); appData[21] = txCounter;
+
+    // [22-23] แพ็กค่า Battery Voltage ที่อ่านได้จริงส่งไปด้วย
+    appData[22] = (batteryVoltage >> 8); appData[23] = batteryVoltage;
+
+    // Debug ข้อมูลผ่าน Serial Monitor
+    Serial.printf("\n[TX #%d] Lat:%.6f, Lon:%.6f | Dist: %.3f m | Batt: %d mV\n", 
+                  txCounter, latitude, longitude, (float)dis_mm/1000.0, batteryVoltage);
+    Serial.printf("ADXL Raw -> X:%d, Y:%d, Z:%d\n",
+                  (int16_t)((_buff_adxl[1]<<8)|_buff_adxl[0]),
+                  (int16_t)((_buff_adxl[3]<<8)|_buff_adxl[2]),
+                  (int16_t)((_buff_adxl[5]<<8)|_buff_adxl[4]));
+}
+
+void setup() {
+  boardInit(LORA_DEBUG_ENABLE, LORA_DEBUG_SERIAL_NUM, 115200);
+
+// ตั้งค่าความละเอียด ADC เป็น 12-bit สำหรับ nRF52
+  analogReadResolution(12); 
+
+  analogReference(AR_INTERNAL);
+
+  pinMode(PIN_VEXT_CTL, OUTPUT);
+  digitalWrite(PIN_VEXT_CTL, HIGH);
+  delay(500);
+
+  Wire.setPins(29, 31);
+  Wire.begin();
+  Serial2.begin(9600);
+
+  // Init ADXL345
+  writeTo(0x31, 0x01); // +/- 4G
+  writeTo(0x2D, 0x08); // Measure Mode
+  
+  MibRequestConfirm_t mibReq;
+  mibReq.Type = MIB_RX2_CHANNEL;
+  mibReq.Param.Rx2Channel.Frequency = 923200000; // ล็อกความถี่ขารับช่องที่ 2 ไว้ที่ 923.2 MHz (มาตรฐานไทย)
+  mibReq.Param.Rx2Channel.Datarate = DR_2;        
+  LoRaMacMibSetRequestConfirm(&mibReq);
+  Serial.println("[LoRaWAN] RX2 Frequency forced to 923.2 MHz (DR2)");
+  // ========================================================
+
+  Serial.println("Wait for GPS fix...");
+  deviceState = DEVICE_STATE_INIT;
+}
+
+void loop() {
+
+  while (Serial2.available()) gps.encode(Serial2.read());
+
+  switch (deviceState) {
+    case DEVICE_STATE_INIT:
+      LoRaWAN.init(loraWanClass, loraWanRegion);
+      deviceState = DEVICE_STATE_JOIN;
+      break;
+    case DEVICE_STATE_JOIN:
+      LoRaWAN.join();
+      break;
+    case DEVICE_STATE_SEND:
+      prepareTxFrame(appPort);
+      LoRaWAN.send();
+      deviceState = DEVICE_STATE_CYCLE;
+      break;
+    case DEVICE_STATE_CYCLE:
+      LoRaWAN.cycle(appTxDutyCycle);
+      deviceState = DEVICE_STATE_SLEEP;
+      break;
+    case DEVICE_STATE_SLEEP:
+      LoRaWAN.sleep(loraWanClass);
+      break;
+    default:
+      deviceState = DEVICE_STATE_INIT;
+      break;
+  }
+}
