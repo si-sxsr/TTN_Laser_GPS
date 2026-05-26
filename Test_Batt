@@ -1,0 +1,56 @@
+#include <Arduino.h>
+#include "heltec_nrf_lorawan.h" 
+
+// --- Battery Settings ---
+#define PIN_BAT_ADC      4    
+#define PIN_BAT_ADC_CTL  6    
+float batteryVoltage = 0;   
+float sum = 0;
+float adcValue = 0;
+int a =0;
+
+uint16_t readBattery() {
+  pinMode(PIN_BAT_ADC_CTL, OUTPUT);
+  digitalWrite(PIN_BAT_ADC_CTL, LOW); 
+  delay(50); 
+  float read = analogRead(5);
+  adcValue = (read*0.1)+(adcValue*0.9);
+  Serial.print("Read "); Serial.println(read);
+  Serial.print("ADC Value (Pin 5): "); Serial.println(adcValue);
+
+  digitalWrite(PIN_BAT_ADC_CTL, HIGH);
+
+  uint16_t mv = adcValue * 2; 
+  return mv;
+}
+
+void setup() {
+  boardInit(LORA_DEBUG_ENABLE, LORA_DEBUG_SERIAL_NUM, 115200);
+
+  analogReadResolution(12); 
+  analogReference(AR_INTERNAL);
+
+  
+
+  for (int i = 0; i < 40; i++) {
+    sum += analogRead(5); // อ่านจากพิน 5 
+    delay(10);
+    Serial.println(i);
+  }
+  adcValue = sum / 40;
+  delay(1500);
+  Serial.print("******ADC Raw Value (Pin 5): "); Serial.println(adcValue);
+  Serial.println("Battery Reader Initialized via Heltec Board.");
+  Serial.println(""); Serial.println("");
+}
+
+void loop() {
+  a++;
+  Serial.println(a);
+  batteryVoltage = readBattery(); 
+  
+  Serial.printf("Battery Volt: %d mV (%.2f V)\n", batteryVoltage, (float)batteryVoltage / 1000.0);
+  Serial.println("---------------------------------------");
+
+  delay(5000); 
+}
